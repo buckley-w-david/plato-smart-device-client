@@ -1,0 +1,24 @@
+# The network location where your calibre-server instance can be found
+base_url = "?"
+
+# Login information, if you have accounts set up on your content server (You should!)
+# username = "?"
+# password = "?"
+
+# If you have identifiers set for your books, they are used as identifiers in plato
+# If not set the title is used
+# identifier = "?"
+
+# Category information
+category = 1
+item = 2
+
+# Which library is everything in (category, item, and the books themselves)
+library = "calibre-library"
+
+# "log" level - How much information to notify about, default if unset is 1
+# 0 - Errors only
+# 1 - Status: Network status, and "all done" message
+# 2 - Verbose: Changes (new books synced and updates to existing books)
+# 3 - Debug mode, log all the things
+# log = 1
