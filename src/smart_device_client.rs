@@ -19,6 +19,8 @@ use sha1::{Digest, Sha1};
 
 use crate::error::PlatoSmartDeviceClientError;
 use crate::message::Message;
+use crate::logger;
+use crate::metadata::Metadata;
 
 const BROADCAST_PORTS: &[u16] = &[54982, 48123, 39001, 44044, 59678];
 const BROADCAST_MSG: &[u8] = &[104, 101, 108, 108, 111];
@@ -31,7 +33,7 @@ const NAME: &'static str = env!("CARGO_PKG_NAME");
 const DEVICE_NAME: &'static str = concatcp!(NAME, "(", VERSION, ")");
 
 #[derive(FromPrimitive, Debug, Serialize)]
-pub enum Opcode {
+enum Opcode {
     NOOP = 12,
     OK = 0,
     BookDone = 11,
@@ -54,11 +56,23 @@ pub enum Opcode {
     TotalSpace = 4,
 }
 
-#[derive(Debug)]
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum ClientError {
+    #[error("An error occured carrying out a command from Calibre")]
+    ProtocolError(serde_json::Value),
+    #[error("An unrecoverable error occured")]
+    ApplicationError(String),
+    #[error("Other")]
+    Other(#[from] anyhow::Error),
+}
+
 pub struct SmartDeviceClient {
     addr: SocketAddr,
     password: Option<String>,
     save_path: PathBuf,
+    logger: logger::Logger,
 }
 
 impl SmartDeviceClient {
@@ -66,15 +80,18 @@ impl SmartDeviceClient {
         addr: Option<SocketAddr>,
         password: Option<String>,
         save_path: PathBuf,
+        log_level: u8,
     ) -> Result<SmartDeviceClient, Error> {
         let addr = addr.or(SmartDeviceClient::find_calibre_server()?).ok_or(
             PlatoSmartDeviceClientError::new("Unable to find calibre server address"),
         )?;
 
+        let logger = logger::Logger::new(log_level);
         Ok(SmartDeviceClient {
             addr,
             password,
             save_path,
+            logger,
         })
     }
 
@@ -108,7 +125,6 @@ impl SmartDeviceClient {
         Ok(calibre_addr)
     }
 
-    // Use this to recieve stuff like files
     fn read_binary_from_net(mut stream: &TcpStream, length: usize) -> Result<Vec<u8>, Error> {
         let mut buffer = vec![0; length];
         let mut buf = &mut buffer[..];
@@ -180,57 +196,49 @@ impl SmartDeviceClient {
             let result = SmartDeviceClient::read_command_from_net(&stream);
             if let Ok((opcode, message)) = result {
                 let response = match opcode {
-                    Opcode::NOOP => self.on_noop(message, &sender),
-                    Opcode::CalibreBusy => self.on_calibre_busy(message, &sender),
-                    Opcode::SetLibraryInfo => self.on_set_library_info(message, &sender),
-                    Opcode::DeleteBook => self.on_delete_book(message, &sender),
-                    Opcode::DisplayMessage => self.on_display_message(message, &sender),
-                    Opcode::FreeSpace => self.on_free_space(message, &sender),
-                    Opcode::GetBookFileSegment => self.on_get_book_file_segment(message, &sender),
-                    Opcode::GetBookMetadata => self.on_get_book_metadata(message, &sender),
-                    Opcode::GetBookCount => self.on_get_book_count(message, &sender),
+                    Opcode::NOOP => self.on_noop(message, &sender, &stream),
+                    Opcode::CalibreBusy => self.on_calibre_busy(message, &sender, &stream),
+                    Opcode::SetLibraryInfo => self.on_set_library_info(message, &sender, &stream),
+                    Opcode::DeleteBook => self.on_delete_book(message, &sender, &stream),
+                    Opcode::DisplayMessage => self.on_display_message(message, &sender, &stream),
+                    Opcode::FreeSpace => self.on_free_space(message, &sender, &stream),
+                    Opcode::GetBookFileSegment => self.on_get_book_file_segment(message, &sender, &stream),
+                    Opcode::GetBookMetadata => self.on_get_book_metadata(message, &sender, &stream),
+                    Opcode::GetBookCount => self.on_get_book_count(message, &sender, &stream),
                     Opcode::GetDeviceInformation => {
-                        self.on_get_device_information(message, &sender)
+                        self.on_get_device_information(message, &sender, &stream)
                     }
                     Opcode::GetInitializationInfo => {
-                        self.on_get_initialization_info(message, &sender)
+                        self.on_get_initialization_info(message, &sender, &stream)
                     }
-                    Opcode::SendBooklists => self.on_send_booklists(message, &sender),
-                    Opcode::SendBook => self.on_send_book(message, &sender),
-                    Opcode::SendBookMetadata => self.on_send_book_metadata(message, &sender),
+                    Opcode::SendBooklists => self.on_send_booklists(message, &sender, &stream),
+                    Opcode::SendBook => self.on_send_book(message, &sender, &stream),
+                    Opcode::SendBookMetadata => self.on_send_book_metadata(message, &sender, &stream),
                     Opcode::SetCalibreDeviceInfo => {
-                        self.on_set_calibre_device_info(message, &sender)
+                        self.on_set_calibre_device_info(message, &sender, &stream)
                     }
                     Opcode::SetCalibreDeviceName => {
-                        self.on_set_calibre_device_name(message, &sender)
+                        self.on_set_calibre_device_name(message, &sender, &stream)
                     }
-                    Opcode::TotalSpace => self.on_total_space(message, &sender),
+                    Opcode::TotalSpace => self.on_total_space(message, &sender, &stream),
                     _ => Ok(None),
                 };
 
                 let send_result = match response {
                     Ok(Some(resp)) => SmartDeviceClient::send(&stream, (Opcode::OK, resp)),
-                    Err(Some(resp)) => SmartDeviceClient::send(&stream, (Opcode::Error, resp)),
-                    Err(None) => Err(anyhow!(format!("Error resposne to {:?}", opcode))),
+                    Err(ClientError::ProtocolError(resp)) => SmartDeviceClient::send(&stream, (Opcode::Error, resp)),
+                    Err(e) => Err(e.into()),
                     _ => Ok(()),
                 };
-                if send_result.is_err() {
-                    dbg!(&send_result);
-                    sender
-                        .send(Message::Notify(
-                            "Error communicating with calibre...".to_string(),
-                        ))
-                        .unwrap();
+                if let Err(error) = send_result {
+                    eprintln!("Error handling {:?}: {:#}.", opcode, error);
+                    self.logger.error( &[&format!("Error communicating with calibre... {:#}", error)]);
                     // Should I exit here?
                     // sender.send(Message::Exit).unwrap();
                 }
-            } else {
-                dbg!(&result);
-                sender
-                    .send(Message::Notify(
-                        "Something went wrong! Exiting...".to_string(),
-                    ))
-                    .unwrap();
+            } else if let Err(error) = result {
+                eprintln!("Error reading command {:#}.", error);
+                self.logger.error( &[&format!("Error communicating with calibre... {:#}", error)]);
                 sender.send(Message::Exit).unwrap();
             }
         }
@@ -253,8 +261,9 @@ impl SmartDeviceClient {
         &self,
         message: serde_json::Value,
         sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
-        // logger.debug("NOOP: %s", payload)
+        stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"NOOP", &message]);
 
         // calibre wants to close the socket, time to disconnect
         if let Some(_ejecting) = message.get("ejecting") {
@@ -289,7 +298,9 @@ impl SmartDeviceClient {
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"CALIBRE_BUSY", &message]);
         Ok(None)
     }
 
@@ -298,8 +309,10 @@ impl SmartDeviceClient {
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
         // TODO actual implementation
+        self.logger.debug(&[&"SET_LIBRARY_INFO", &message]);
         Ok(Some(json!({})))
     }
 
@@ -310,7 +323,9 @@ impl SmartDeviceClient {
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"DELETE_BOOK", &message]);
         Ok(None)
     }
 
@@ -320,18 +335,21 @@ impl SmartDeviceClient {
     fn on_display_message(
         &self,
         message: serde_json::Value,
-        sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
-        sender.send(Message::Notify(message.to_string())).unwrap();
+        _sender: &Sender<Message>,
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"DISPLAY_MESSAGE", &message]);
         Ok(Some(json!({})))
     }
 
     // FREE_SPACE requires a response
     fn on_free_space(
         &self,
-        _message: serde_json::Value,
+        message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"FREE_SPACE", &message]);
         // FIXME: Should probably check the status on the save path that we own
         let info = statvfs::statvfs(&self.save_path);
         if let Ok(info) = info {
@@ -340,7 +358,7 @@ impl SmartDeviceClient {
             // let total = info.blocks() as u64 * fbs;
             Ok(Some(json!({ "free_space_on_device": free })))
         } else {
-            Err(Some(json!({
+            Err(ClientError::ProtocolError(json!({
                 "message": "Unable to get size information",
             })))
         }
@@ -351,7 +369,9 @@ impl SmartDeviceClient {
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"GET_BOOK_FILE_SEGMENT", &message]);
         // message looks like this
         // {'lpath' : path, 'position': position,
         //  'thisBook': this_book, 'totalBooks': total_books,
@@ -367,7 +387,9 @@ impl SmartDeviceClient {
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"GET_BOOK_METADATA", &message]);
         Ok(None)
     }
 
@@ -383,7 +405,9 @@ impl SmartDeviceClient {
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"GET_BOOK_COUNT", &message]);
         // TODO actual implementation
         // TODO Need to look into what these options actually do
         // message={"canStream": true, "canScan": true, "willUseCachedMetadata": true, "supportsSync": false, "canSupportBookFormatSync": true}
@@ -398,12 +422,15 @@ impl SmartDeviceClient {
     // GET_DEVICE_INFORMATION requires a response
     fn on_get_device_information(
         &self,
-        _message: serde_json::Value,
+        message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"GET_DEVICE_INFORMATION", &message]);
         // TODO actual implementation
         Ok(Some(json!({
             "device_info": {
+                // TODO: Need to persist this from run to run so calibre remembers us
                 // 'device_store_uuid' = CalibreMetadata.drive.device_store_uuid,
                 "device_name": "Kobo",
             },
@@ -441,12 +468,14 @@ impl SmartDeviceClient {
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"GET_INITIALIZATION_INFO", &message]);
         // logger.debug("default GET_INITIALIZATION_INFO handler called: %s", payload)
 
         let init_info = json!({
             "appName": NAME,
-            "acceptedExtensions": ["epub"],
+            "acceptedExtensions": ["epub"], // TODO: more paths
             "cacheUsesLpaths": true,
             "canAcceptLibraryInfo": true,
             "canDeleteMultipleBooks": true,
@@ -459,7 +488,7 @@ impl SmartDeviceClient {
             "coverHeight": 240,
             "deviceKind": "Kobo",
             "deviceName": DEVICE_NAME,
-            "extensionPathLengths": [37],
+            "extensionPathLengths": {"epub": 37}, // TODO: more paths, also explanation of magic number
             "passwordHash": self.get_password_hash(message.get("passwordChallenge").and_then(|v| v.as_str())),
             "maxBookContentPacketLen": 4096,
             "useUuidFileNames": false,
@@ -473,18 +502,32 @@ impl SmartDeviceClient {
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"SEND_BOOKLISTS", &message]);
         // I imagine when I start giving reporting books that collection object wil be pretty big
         // message={'count': 0, 'collections': {}, 'willStreamMetadata': True, 'supportsSync': False}
         Ok(None)
     }
 
     // SEND_BOOK _can_ require a response, the canSendOkToSendbook key we return from GET_INITIALIZATION_INFO
+    // Right now we send false for that, which lets us just start reading when we get SEND_BOOK
+    // instead of having to return back to the event loop to send our response.
+    //
+    // I've kinda painted myself into a corner. If I want to keep this structure of a stateless
+    // event loop then I have to let the handlers do more, including reading further data from the
+    // stream, which I don't really like.
     fn on_send_book(
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"SEND_BOOK", &message]);
+        let length = message.get("length").and_then(|v| v.as_u64()).ok_or(
+            ClientError::ProtocolError(json!({"message": "You didn't send me a length!"}))
+        )?;
+        let _book = SmartDeviceClient::read_binary_from_net(stream, length as usize)?;
         Ok(None)
     }
 
@@ -493,7 +536,9 @@ impl SmartDeviceClient {
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"SEND_BOOK_METADATA", &message]);
         Ok(None)
     }
 
@@ -502,32 +547,39 @@ impl SmartDeviceClient {
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"SET_CALIBRE_DEVICE_INFO", &message]);
+        // message={'device_name': 'Kobo', 'device_store_uuid': 'ae9fbd10-9ce0-49b9-95d8-f7a8e82d622a', 'location_code': 'main', 'last_library_uuid': '6b151ef5-03cd-4a9a-8d6b-e50387065299', 'calibre_version': '5.32.0', 'date_last_connected': '2021-11-26T18:41:03.851958+00:00', 'prefix': ''}
         Ok(Some(json!({})))
     }
 
     // SET_CALIBRE_DEVICE_NAME requires a response
     fn on_set_calibre_device_name(
         &self,
-        _message: serde_json::Value,
+        message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"SET_CALIBRE_DEVICE_NAME", &message]);
         Ok(Some(json!({})))
     }
 
     // TOTAL_SPACE requires a response
     fn on_total_space(
         &self,
-        _message: serde_json::Value,
+        message: serde_json::Value,
         _sender: &Sender<Message>,
-    ) -> Result<Option<serde_json::Value>, Option<serde_json::Value>> {
+        _stream: &TcpStream
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        self.logger.debug(&[&"TOTAL_SPACE", &message]);
         let info = statvfs::statvfs(&self.save_path);
         if let Ok(info) = info {
             let fbs = info.fragment_size() as u64;
             let total = info.blocks() as u64 * fbs;
             Ok(Some(json!({ "total_space_on_device": total })))
         } else {
-            Err(Some(json!({
+            Err(ClientError::ProtocolError(json!({
                 "message": "Unable to get size information",
             })))
         }

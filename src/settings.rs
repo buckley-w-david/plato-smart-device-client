@@ -11,11 +11,11 @@ pub struct Settings {
     pub host: Option<SocketAddr>,
     pub password: Option<String>,
     #[serde(default = "one")]
-    pub log: u64,
+    pub log: u8,
 }
 
 // Is this really the correct way to put a default value?
-fn one() -> u64 {
+fn one() -> u8 {
     1
 }
 

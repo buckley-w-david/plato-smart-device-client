@@ -4,6 +4,7 @@ mod logger;
 mod message;
 mod settings;
 mod smart_device_client;
+mod metadata;
 mod types;
 
 use std::env;
@@ -12,6 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc::channel, Arc};
+use std::time::Duration;
 use std::thread;
 
 use anyhow::{format_err, Context, Error};
@@ -47,24 +49,24 @@ fn main() -> Result<(), Error> {
 
     let settings::Settings { log, .. } = settings;
     let logger = Logger::new(log);
-    logger.debug("Starting plato-smart-device-client!");
+    logger.debug(&[&"Starting plato-smart-device-client!"]);
 
     if !online {
-        logger.debug("Not online!");
+        logger.debug(&[&"Not online!"]);
         if !wifi {
-            logger.debug("Wifi is off!");
-            logger.status("Establishing a network connection.");
+            logger.debug(&[&"Wifi is off!"]);
+            logger.status(&[&"Establishing a network connection."]);
             Event::SetWifi(true).send();
         } else {
-            logger.debug("Wifi is on!");
-            logger.status("Waiting for the network to come up.");
+            logger.debug(&[&"Wifi is on!"]);
+            logger.status(&[&"Waiting for the network to come up."]);
             // Throw away network coming up event
             let _event = Response::receive();
         }
     }
 
     if !save_path.exists() {
-        logger.debug("Creating save directory");
+        logger.debug(&[&"Creating save directory"]);
         fs::create_dir(&save_path)?;
     }
 
@@ -79,7 +81,7 @@ fn main() -> Result<(), Error> {
 
     let sigterm2 = sigterm.clone();
     let handle = thread::spawn(move || {
-        let client = SmartDeviceClient::new(calibre_addr, password, save_path).unwrap();
+        let client = SmartDeviceClient::new(calibre_addr, password, save_path, log).unwrap();
         client.serve(sigterm2, sender).unwrap();
     });
 
@@ -88,25 +90,16 @@ fn main() -> Result<(), Error> {
             break;
         }
 
-        match receiver.try_recv() {
-            Ok(Message::Notify(msg)) => {
-                logger.status(&msg);
-            }
-            Ok(Message::AddBook(book_data)) => {
-                // TODO write book to file
-                //      send addDocument event
-            }
+        match receiver.recv_timeout(Duration::from_secs(1)) {
             Ok(Message::Exit) => {
                 sigterm.store(true, Ordering::Relaxed);
             }
             Err(_) => (),
         }
-
-        // TODO: Put some kind of sleep in here to not just burn through cycles doing nothing
     }
 
     handle.join().unwrap();
-    logger.status("Bye bye!");
+    logger.status(&[&"Bye bye!"]);
 
     Ok(())
 }
