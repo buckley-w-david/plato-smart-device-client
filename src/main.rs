@@ -2,9 +2,9 @@ mod error;
 mod event;
 mod logger;
 mod message;
+mod metadata;
 mod settings;
 mod smart_device_client;
-mod metadata;
 mod types;
 
 use std::env;
@@ -13,8 +13,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc::channel, Arc};
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{format_err, Context, Error};
 
@@ -81,7 +81,8 @@ fn main() -> Result<(), Error> {
 
     let sigterm2 = sigterm.clone();
     let handle = thread::spawn(move || {
-        let client = SmartDeviceClient::new(calibre_addr, password, save_path, log).unwrap();
+        let client =
+            SmartDeviceClient::new(calibre_addr, password, save_path, library_path, log).unwrap();
         client.serve(sigterm2, sender).unwrap();
     });
 

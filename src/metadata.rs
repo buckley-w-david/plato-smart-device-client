@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 // TODO: Verify these types
 #[derive(Serialize, Deserialize, Debug)]
@@ -11,5 +11,5 @@ pub struct Metadata {
     authors: Vec<String>,
     tags: Vec<String>,
     series: String,
-    series_index: usize
+    series_index: usize,
 }

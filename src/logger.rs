@@ -15,7 +15,13 @@ impl Logger {
 
     pub fn log(&self, msg: &[&dyn Display], level: u8) {
         if level <= self.0 {
-            Event::Notify(&msg.iter().map(|d| d.to_string()).collect::<Vec<String>>().join(" ")).send();
+            Event::Notify(
+                &msg.iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<String>>()
+                    .join(" "),
+            )
+            .send();
         }
     }
 
