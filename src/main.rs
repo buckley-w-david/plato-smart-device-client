@@ -1,4 +1,3 @@
-mod error;
 mod event;
 mod logger;
 mod message;
@@ -81,9 +80,16 @@ fn main() -> Result<(), Error> {
 
     let sigterm2 = sigterm.clone();
     let handle = thread::spawn(move || {
-        let client =
-            SmartDeviceClient::new(calibre_addr, password, save_path, library_path, log).unwrap();
-        client.serve(sigterm2, sender).unwrap();
+        let sigterm3 = sigterm2.clone();
+        let client = SmartDeviceClient::new(calibre_addr, password, save_path, library_path, log);
+
+        if let Ok(client) = client {
+            match client.serve(sigterm2, sender) {
+                Ok(_) => (),
+                Err(_) => (),
+            }
+        }
+        sigterm3.store(true, Ordering::Relaxed);
     });
 
     loop {

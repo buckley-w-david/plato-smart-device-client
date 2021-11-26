@@ -19,7 +19,6 @@ use serde_json::{self, json};
 
 use sha1::{Digest, Sha1};
 
-use crate::error::PlatoSmartDeviceClientError;
 use crate::event;
 use crate::logger;
 use crate::message::Message;
@@ -66,7 +65,7 @@ use thiserror::Error;
 pub enum ClientError {
     #[error("An error occured carrying out a command from Calibre")]
     ProtocolError(serde_json::Value),
-    #[error("An unrecoverable error occured")]
+    #[error("An error occured doing our own thing")]
     ApplicationError(String),
     #[error("Files!")]
     File(#[from] io::Error),
@@ -91,7 +90,7 @@ impl SmartDeviceClient {
         log_level: u8,
     ) -> Result<SmartDeviceClient, Error> {
         let addr = addr.or(SmartDeviceClient::find_calibre_server()?).ok_or(
-            PlatoSmartDeviceClientError::new("Unable to find calibre server address"),
+            ClientError::ApplicationError("Unable to find calibre server address".into()),
         )?;
 
         let logger = logger::Logger::new(log_level);
@@ -173,21 +172,21 @@ impl SmartDeviceClient {
         // Maybe it's a rust thing, but it is strange that I can't seem to
         // read a specific number of bytes without doing it like this.
         let encoded_json = std::str::from_utf8(message_buffer.as_slice())?;
-        let value: serde_json::Value = serde_json::from_str(encoded_json)?;
-        let arr = value.as_array().ok_or(PlatoSmartDeviceClientError::new(
-            "Unable to parse calibre response",
+        let mut value: serde_json::Value = serde_json::from_str(encoded_json)?;
+        let arr = value.as_array_mut().ok_or(ClientError::ApplicationError(
+            "Unable to parse calibre response".into(),
         ))?;
 
-        let opcode = arr[0]
-            .as_i64()
-            .ok_or(PlatoSmartDeviceClientError::new("Opcode is not a number"))?;
+        let message = arr.remove(1);
+        let encoded_opcode = arr.remove(0).as_i64().ok_or(ClientError::ApplicationError(
+            "Opcode is not a number".into(),
+        ))?;
 
-        let message = arr[1].to_owned();
+        let opcode: Opcode = FromPrimitive::from_i64(encoded_opcode).ok_or(
+            ClientError::ApplicationError("Opcode not registered".into()),
+        )?;
 
-        let x: Opcode = FromPrimitive::from_i64(opcode)
-            .ok_or(PlatoSmartDeviceClientError::new("Opcode not registered"))?;
-
-        Ok((x, message))
+        Ok((opcode, message))
     }
 
     pub fn serve(&self, sigterm: Arc<AtomicBool>, sender: Sender<Message>) -> Result<(), Error> {
@@ -562,7 +561,6 @@ impl SmartDeviceClient {
         let mut file = File::create(&epub_path)?;
         file.write_all(&book[..])?;
 
-        dbg!(epub_path.strip_prefix(&self.library_path));
         if let Ok(path) = epub_path.strip_prefix(&self.library_path) {
             let file_info = FileInfo {
                 path: path.to_path_buf(),
