@@ -2,14 +2,26 @@ use chrono::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct FileInfo {
     pub path: PathBuf,
     pub kind: String,
     pub size: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+impl Default for FileInfo {
+    fn default() -> Self {
+        FileInfo {
+            path: PathBuf::default(),
+            kind: String::default(),
+            size: u64::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Info {
     pub title: String,
 
@@ -21,6 +33,19 @@ pub struct Info {
 
     #[serde(with = "datetime_format")]
     pub added: DateTime<Local>,
+}
+
+
+impl Default for Info {
+    fn default() -> Self {
+        Info {
+            title: String::default(),
+            author: String::default(),
+            identifier: String::default(),
+            file: FileInfo::default(),
+            added: Local::now(),
+        }
+    }
 }
 
 mod datetime_format {

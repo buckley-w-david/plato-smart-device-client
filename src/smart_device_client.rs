@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Write, BufReader};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,6 +67,8 @@ pub enum ClientError {
     ProtocolError(serde_json::Value),
     #[error("An error occured doing our own thing")]
     ApplicationError(String),
+    #[error("JSON!")]
+    Json(#[from] serde_json::Error),
     #[error("Files!")]
     File(#[from] io::Error),
     #[error("Other")]
@@ -417,22 +419,46 @@ impl SmartDeviceClient {
     //
     //        If I want to keep the client structure as-is I'll have to return an iterable of
     //        responses, with each being sent individually
+    //
+    //        Maybe I just leak the abstraction a little bit...
     fn on_get_book_count(
         &self,
         message: serde_json::Value,
         _sender: &Sender<Message>,
-        _stream: &TcpStream,
+        stream: &TcpStream,
     ) -> Result<Option<serde_json::Value>, ClientError> {
         self.logger.debug(&[&"GET_BOOK_COUNT", &message]);
-        // TODO actual implementation
-        // TODO Need to look into what these options actually do
-        // message={"canStream": true, "canScan": true, "willUseCachedMetadata": true, "supportsSync": false, "canSupportBookFormatSync": true}
-        Ok(Some(json!({
+        let e = event::Event::Search{ path: &self.save_path, query: "".to_string() };
+
+        if let Some(event::Response::Search(search)) = e.send() {
+            let count =  search.results.len();
+            SmartDeviceClient::send(stream, (Opcode::OK, json!({
+                "willStream": true,
+                "willScan": true,
+                "count": count,
+            })))?;
+
+            for info in search.results {
+                // This shouldn't really use a '?'
+                // calibre expects to be sent a specific number of metadata objects
+                // If we don't do that, everything probably breaks
+                SmartDeviceClient::send(stream, (Opcode::OK, json!({
+                    "lpath": info.file.path,
+                    "size": info.file.size,
+                    "title": info.title,
+                    "authors": info.author.split(", ").collect::<String>(),
+                    "last_modified": info.added.to_rfc3339(),
+                })))?;
+            }
+
+            Ok(None)
+        } else {
+             Ok(Some(json!({
                 "willStream": true,
                 "willScan": true,
                 "count": 0,
-            }
-        )))
+            })))
+        }
     }
 
     // GET_DEVICE_INFORMATION requires a response
@@ -444,15 +470,29 @@ impl SmartDeviceClient {
     ) -> Result<Option<serde_json::Value>, ClientError> {
         self.logger.debug(&[&"GET_DEVICE_INFORMATION", &message]);
         // TODO actual implementation
-        Ok(Some(json!({
-            "device_info": {
-                // TODO: Need to persist this from run to run so calibre remembers us
-                // 'device_store_uuid' = CalibreMetadata.drive.device_store_uuid,
-                "device_name": "Kobo",
-            },
-            "version": VERSION,
-            "device_version": VERSION,
-        })))
+        let drive_info = self.save_path.join(".driveinfo.calibre");
+        if drive_info.exists() {
+            let file = File::open(drive_info)?;
+            let reader = BufReader::new(file);
+
+            let drive_info: serde_json::Value = serde_json::from_reader(reader)?;
+            Ok(Some(json!({
+                "device_info": {
+                   "device_store_uuid": drive_info.get("device_store_uuid"),
+                    "device_name": DEVICE_NAME,
+                },
+                "version": VERSION,
+                "device_version": VERSION,
+            })))
+        } else {
+            Ok(Some(json!({
+                "device_info": {
+                    "device_name": DEVICE_NAME,
+                },
+                "version": VERSION,
+                "device_version": VERSION,
+            })))
+        }
     }
 
     // I still think this auth protocol is weird
@@ -499,7 +539,7 @@ impl SmartDeviceClient {
             "canSendOkToSendbook": false, // TODO: probably actually true
             "canStreamBooks": true,
             "canStreamMetadata": true,
-            "canUseCachedMetadata": true,
+            "canUseCachedMetadata": false, // TODO: cache metadata
             "ccVersionNumber": VERSION,
             "coverHeight": 240,
             "deviceKind": "Kobo",
@@ -535,7 +575,7 @@ impl SmartDeviceClient {
     // stream, which I don't really like.
     fn on_send_book(
         &self,
-        message: serde_json::Value,
+        mut message: serde_json::Value,
         _sender: &Sender<Message>,
         stream: &TcpStream,
     ) -> Result<Option<serde_json::Value>, ClientError> {
@@ -547,6 +587,9 @@ impl SmartDeviceClient {
                 .ok_or(ClientError::ProtocolError(
                     json!({"message": "You didn't send me a length!"}),
                 ))?;
+
+        let metadata: Metadata = serde_json::from_value(message["metadata"].take())?;
+
         let book = SmartDeviceClient::read_binary_from_net(stream, length as usize)?;
 
         let lpath =
@@ -568,42 +611,12 @@ impl SmartDeviceClient {
                 size: file.metadata().ok().map_or(0, |m| m.len()),
             };
 
-            let author = message
-                .pointer("/metadata/authors")
-                .and_then(|v| v.as_array())
-                .and_then(|v| {
-                    Some(
-                        v.iter()
-                            .filter_map(|vv| vv.as_str())
-                            .collect::<Vec<&str>>()
-                            .join(", "),
-                    )
-                })
-                .ok_or(ClientError::ProtocolError(
-                    json!({"message": "Bad or missing authors"}),
-                ))?;
-
-            let title = message
-                .pointer("/metadata/title")
-                .and_then(|v| v.as_str())
-                .ok_or(ClientError::ProtocolError(
-                    json!({"message": "Bad or missing title"}),
-                ))?;
-
-            let timestamp = message
-                .pointer("/metadata/timestamp")
-                .and_then(|v| v.as_str())
-                .and_then(|v| v.parse::<DateTime<Utc>>().ok())
-                .ok_or(ClientError::ProtocolError(
-                    json!({"message": "Bad or missing title"}),
-                ))?;
-
             let info = Info {
-                title: title.to_string(),
-                identifier: "".to_string(),
-                author: author,
+                title: metadata.title,
+                identifier: metadata.uuid,
+                author: metadata.authors.join(", "),
                 file: file_info,
-                added: timestamp.into(),
+                added: metadata.last_modified.into(),
             };
 
             event::Event::AddDocument(info).send();
@@ -632,6 +645,10 @@ impl SmartDeviceClient {
     ) -> Result<Option<serde_json::Value>, ClientError> {
         self.logger.debug(&[&"SET_CALIBRE_DEVICE_INFO", &message]);
         // message={'device_name': 'Kobo', 'device_store_uuid': 'ae9fbd10-9ce0-49b9-95d8-f7a8e82d622a', 'location_code': 'main', 'last_library_uuid': '6b151ef5-03cd-4a9a-8d6b-e50387065299', 'calibre_version': '5.32.0', 'date_last_connected': '2021-11-26T18:41:03.851958+00:00', 'prefix': ''}
+        let drive_info = self.save_path.join(".driveinfo.calibre");
+        let mut file = File::create(&drive_info)?;
+        file.write_all(serde_json::to_string(&message)?.as_bytes())?;
+
         Ok(Some(json!({})))
     }
 
